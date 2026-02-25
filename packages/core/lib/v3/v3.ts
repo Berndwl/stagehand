@@ -1,4 +1,3 @@
-import dotenv from "dotenv";
 import { EventEmitter } from "events";
 import fs from "fs";
 import os from "os";
@@ -10,28 +9,30 @@ import {
   InferStagehandSchema,
   StagehandZodSchema,
   toJsonSchema,
-} from "./zodCompat";
-import { loadApiKeyFromEnv } from "../utils";
-import { StagehandLogger, LoggerOptions } from "../logger";
-import { ActCache } from "./cache/ActCache";
-import { AgentCache } from "./cache/AgentCache";
-import { CacheStorage } from "./cache/CacheStorage";
-import { ActHandler } from "./handlers/actHandler";
-import { ExtractHandler } from "./handlers/extractHandler";
-import { ObserveHandler } from "./handlers/observeHandler";
-import { V3AgentHandler } from "./handlers/v3AgentHandler";
-import { V3CuaAgentHandler } from "./handlers/v3CuaAgentHandler";
-import { createBrowserbaseSession } from "./launch/browserbase";
-import { launchLocalChrome } from "./launch/local";
-import { LLMClient } from "./llm/LLMClient";
-import { LLMProvider } from "./llm/LLMProvider";
+} from "./zodCompat.js";
+import { loadApiKeyFromEnv } from "../utils.js";
+import { extractModelName } from "../modelUtils.js";
+import { StagehandLogger, LoggerOptions } from "../logger.js";
+import { ActCache } from "./cache/ActCache.js";
+import { AgentCache } from "./cache/AgentCache.js";
+import { CacheStorage } from "./cache/CacheStorage.js";
+import { ActHandler } from "./handlers/actHandler.js";
+import { ExtractHandler } from "./handlers/extractHandler.js";
+import { ObserveHandler } from "./handlers/observeHandler.js";
+import { V3AgentHandler } from "./handlers/v3AgentHandler.js";
+import { V3CuaAgentHandler } from "./handlers/v3CuaAgentHandler.js";
+import { createBrowserbaseSession } from "./launch/browserbase.js";
+import { launchLocalChrome } from "./launch/local.js";
+import { LLMClient } from "./llm/LLMClient.js";
+import { LLMProvider } from "./llm/LLMProvider.js";
 import {
   bindInstanceLogger,
   unbindInstanceLogger,
-  v3Logger,
   withInstanceLogContext,
-} from "./logger";
-import { resolveTools } from "./mcp/utils";
+} from "./logger.js";
+import { cleanupLocalBrowser } from "./shutdown/cleanupLocal.js";
+import { startShutdownSupervisor } from "./shutdown/supervisorClient.js";
+import { resolveTools } from "./mcp/utils.js";
 import {
   ActHandlerParams,
   ExtractHandlerParams,
@@ -39,7 +40,11 @@ import {
   AgentReplayStep,
   InitState,
   AgentCacheContext,
-} from "./types/private";
+} from "./types/private/index.js";
+import type {
+  ShutdownSupervisorConfig,
+  ShutdownSupervisorHandle,
+} from "./types/private/shutdown.js";
 import {
   AgentConfig,
   AgentExecuteCallbacks,
@@ -73,16 +78,16 @@ import {
   MissingEnvironmentVariableError,
   StagehandInitError,
   AgentStreamResult,
-} from "./types/public";
-import { V3Context } from "./understudy/context";
-import { Page } from "./understudy/page";
-import { resolveModel } from "../modelUtils";
-import { StagehandAPIClient } from "./api";
-import { validateExperimentalFeatures } from "./agent/utils/validateExperimentalFeatures";
-import { SessionFileLogger, logStagehandStep } from "./flowLogger";
-import { createTimeoutGuard } from "./handlers/handlerUtils/timeoutGuard";
-import { ActTimeoutError } from "./types/public/sdkErrors";
-import type { Protocol } from "devtools-protocol";
+} from "./types/public/index.js";
+import { V3Context } from "./understudy/context.js";
+import { Page } from "./understudy/page.js";
+import { resolveModel } from "../modelUtils.js";
+import { StagehandAPIClient } from "./api.js";
+import { validateExperimentalFeatures } from "./agent/utils/validateExperimentalFeatures.js";
+import { flattenVariables } from "./agent/utils/variables.js";
+import { SessionFileLogger, logStagehandStep } from "./flowLogger.js";
+import { createTimeoutGuard } from "./handlers/handlerUtils/timeoutGuard.js";
+import { ActTimeoutError } from "./types/public/sdkErrors.js";
 
 const DEFAULT_MODEL_NAME = "openai/gpt-4.1-mini";
 const DEFAULT_VIEWPORT = { width: 1288, height: 711 };
@@ -118,7 +123,6 @@ function resolveModelConfiguration(
 
   return { modelName: DEFAULT_MODEL_NAME };
 }
-dotenv.config({ path: ".env" });
 
 /**
  * V3
@@ -231,7 +235,8 @@ export class V3 {
   private actCache: ActCache;
   private agentCache: AgentCache;
   private apiClient: StagehandAPIClient | null = null;
-  private proxyAuthHandlers: Map<string, () => void> = new Map();
+  private keepAlive?: boolean;
+  private shutdownSupervisor: ShutdownSupervisorHandle | null = null;
 
   public stagehandMetrics: StagehandMetrics = {
     actPromptTokens: 0,
@@ -262,10 +267,11 @@ export class V3 {
   };
 
   constructor(opts: V3Options) {
-    V3._installProcessGuards();
     this.externalLogger = opts.logger;
     this.verbose = opts.verbose ?? 1;
     this.instanceId = uuidv7();
+    this.keepAlive =
+      opts.keepAlive ?? opts.browserbaseSessionCreateParams?.keepAlive;
 
     // Create per-instance StagehandLogger (handles usePino, verbose, externalLogger)
     // This gives each V3 instance independent logger configuration
@@ -586,59 +592,43 @@ export class V3 {
     }
   }
 
-  private static _installProcessGuards(): void {
-    if (V3._processGuardsInstalled) return;
-    V3._processGuardsInstalled = true;
-
-    const shutdownAllImmediate = async (reason: string) => {
-      const instances = Array.from(V3._instances);
-      await Promise.all(instances.map((i) => i._immediateShutdown(reason)));
-    };
-
-    process.once("SIGINT", () => {
-      v3Logger({
-        category: "v3",
-        message: "SIGINT: initiating shutdown",
-        level: 0,
-      });
-      for (const instance of V3._instances) {
-        if (instance.apiClient) {
-          void instance.apiClient.end();
-          return;
+  /** Spawn a crash-only supervisor that cleans up when this process dies. */
+  private startShutdownSupervisor(
+    config: ShutdownSupervisorConfig,
+  ): ShutdownSupervisorHandle | null {
+    if (this.shutdownSupervisor) return this.shutdownSupervisor;
+    this.shutdownSupervisor = startShutdownSupervisor(config, {
+      onError: (error, context) => {
+        try {
+          this.logger({
+            category: "v3",
+            message:
+              "Shutdown supervisor unavailable; crash cleanup disabled. " +
+              "If this process exits unexpectedly, local Chrome or Browserbase " +
+              "sessions may remain running even with keepAlive=false.",
+            level: 0,
+            auxiliary: {
+              context: { value: context, type: "string" },
+              error: { value: error.message, type: "string" },
+            },
+          });
+        } catch {
+          // ignore logging failures
         }
-      }
-      void shutdownAllImmediate("signal SIGINT");
+      },
     });
-    process.once("SIGTERM", () => {
-      v3Logger({
-        category: "v3",
-        message: "SIGTERM: initiating shutdown",
-        level: 0,
-      });
-      for (const instance of V3._instances) {
-        if (instance.apiClient) {
-          void instance.apiClient.end();
-          return;
-        }
-      }
-      void shutdownAllImmediate("signal SIGTERM");
-    });
-    process.once("uncaughtException", (err: unknown) => {
-      v3Logger({
-        category: "v3",
-        message: "uncaughtException",
-        level: 0,
-        auxiliary: { err: { value: String(err), type: "string" } },
-      });
-    });
-    process.once("unhandledRejection", (reason: unknown) => {
-      v3Logger({
-        category: "v3",
-        message: "unhandledRejection",
-        level: 0,
-        auxiliary: { reason: { value: String(reason), type: "string" } },
-      });
-    });
+    return this.shutdownSupervisor;
+  }
+
+  /** Stop the supervisor during a normal shutdown. */
+  private stopShutdownSupervisor(): void {
+    if (!this.shutdownSupervisor) return;
+    try {
+      this.shutdownSupervisor.stop();
+    } catch {
+      // best-effort
+    }
+    this.shutdownSupervisor = null;
   }
 
   /**
@@ -791,7 +781,7 @@ export class V3 {
             "--disable-dev-shm-usage",
             "--site-per-process",
           ];
-          let chromeFlags: string[] = [];
+          let chromeFlags: string[];
           const ignore = lbo.ignoreDefaultArgs;
           if (ignore === true) {
             // drop defaults
@@ -831,6 +821,7 @@ export class V3 {
           // add user-supplied args last
           if (Array.isArray(lbo.args)) chromeFlags.push(...lbo.args);
 
+          const keepAlive = this.keepAlive === true;
           const { ws, chrome } = await launchLocalChrome({
             chromePath: lbo.executablePath,
             chromeFlags,
@@ -838,7 +829,15 @@ export class V3 {
             headless: lbo.headless,
             userDataDir,
             connectTimeoutMs: lbo.connectTimeoutMs,
+            handleSIGINT: !keepAlive,
           });
+          if (keepAlive) {
+            try {
+              chrome.process?.unref?.();
+            } catch {
+              // best-effort: avoid keeping the event loop alive
+            }
+          }
           this.ctx = await V3Context.create(ws, {
             env: "LOCAL",
             localBrowserLaunchOptions: lbo,
@@ -858,6 +857,16 @@ export class V3 {
             preserveUserDataDir: !!lbo.preserveUserDataDir,
           };
           this.resetBrowserbaseSessionMetadata();
+          const chromePid = chrome.process?.pid ?? chrome.pid;
+          if (!keepAlive && chromePid) {
+            this.startShutdownSupervisor({
+              kind: "LOCAL",
+              pid: chromePid,
+              userDataDir,
+              createdTempProfile: createdTemp,
+              preserveUserDataDir: !!lbo.preserveUserDataDir,
+            });
+          }
 
           // Post-connect settings (downloads and viewport) if provided
           await this._applyPostConnectLocalOptions(lbo);
@@ -877,26 +886,33 @@ export class V3 {
             message: "Starting browserbase session",
             level: 1,
           });
+          const baseSessionParams =
+            this.opts.browserbaseSessionCreateParams ?? {};
+          const resolvedKeepAlive = this.keepAlive;
+          const keepAlive = this.keepAlive === true;
+          const effectiveSessionParams =
+            resolvedKeepAlive !== undefined
+              ? { ...baseSessionParams, keepAlive: resolvedKeepAlive }
+              : baseSessionParams;
           if (!this.disableAPI && !this.experimental) {
             this.apiClient = new StagehandAPIClient({
               apiKey,
               projectId,
               logger: this.logger,
+              serverCache: this.opts.serverCache,
             });
             const createSessionPayload = {
-              projectId:
-                this.opts.browserbaseSessionCreateParams?.projectId ??
-                projectId,
-              ...this.opts.browserbaseSessionCreateParams,
+              projectId: effectiveSessionParams.projectId ?? projectId,
+              ...effectiveSessionParams,
               browserSettings: {
-                ...(this.opts.browserbaseSessionCreateParams?.browserSettings ??
-                  {}),
-                viewport: this.opts.browserbaseSessionCreateParams
-                  ?.browserSettings?.viewport ?? { width: 1288, height: 711 },
+                ...(effectiveSessionParams.browserSettings ?? {}),
+                viewport: effectiveSessionParams.browserSettings?.viewport ?? {
+                  width: 1288,
+                  height: 711,
+                },
               },
               userMetadata: {
-                ...(this.opts.browserbaseSessionCreateParams?.userMetadata ??
-                  {}),
+                ...(effectiveSessionParams.userMetadata ?? {}),
                 stagehand: "true",
               },
             };
@@ -918,7 +934,7 @@ export class V3 {
           const { ws, sessionId, bb } = await createBrowserbaseSession(
             apiKey,
             projectId,
-            this.opts.browserbaseSessionCreateParams,
+            effectiveSessionParams,
             this.opts.browserbaseSessionID,
           );
           this.ctx = await V3Context.create(ws, {
@@ -933,6 +949,14 @@ export class V3 {
           this.ctx.conn.onTransportClosed(this._onCdpClosed);
           this.state = { kind: "BROWSERBASE", sessionId, ws, bb };
           this.browserbaseSessionId = sessionId;
+          if (!keepAlive && !this.disableAPI) {
+            this.startShutdownSupervisor({
+              kind: "STAGEHAND_API",
+              sessionId,
+              apiKey,
+              projectId,
+            });
+          }
 
           await this._ensureBrowserbaseDownloadsEnabled();
 
@@ -1004,50 +1028,6 @@ export class V3 {
             eventsEnabled: true,
           })
           .catch(() => {});
-      }
-      // Proxy authentication
-      if (lbo.proxy?.username && lbo.proxy?.password) {
-        const page = await this.ctx?.awaitActivePage();
-        if (!page) return;
-
-        const session = page.getSessionForFrame(page.mainFrameId());
-        if (!session) return;
-
-        // Pauses requests until proxy auth is done
-        await session.send("Fetch.enable", {
-          handleAuthRequests: true,
-        });
-
-        // Submits the required authChallengeResponse
-        const authHandler = ({
-          requestId,
-        }: Protocol.Fetch.AuthRequiredEvent) => {
-          session
-            .send("Fetch.continueWithAuth", {
-              requestId,
-              authChallengeResponse: {
-                response: "ProvideCredentials",
-                username: lbo.proxy!.username!,
-                password: lbo.proxy!.password!,
-              },
-            })
-            .catch(() => {});
-        };
-
-        const requestPausedHandler = ({
-          requestId,
-        }: Protocol.Fetch.RequestPausedEvent) => {
-          session.send("Fetch.continueRequest", { requestId }).catch(() => {});
-        };
-
-        session.on("Fetch.authRequired", authHandler);
-        session.on("Fetch.requestPaused", requestPausedHandler);
-
-        // Cleanup listeners
-        this.proxyAuthHandlers.set(page.targetId(), () => {
-          session.off("Fetch.authRequired", authHandler);
-          session.off("Fetch.requestPaused", requestPausedHandler);
-        });
       }
     } catch {
       // best-effort only
@@ -1156,7 +1136,7 @@ export class V3 {
         actCacheContext = await this.actCache.prepareContext(
           input,
           page,
-          options?.variables,
+          flattenVariables(options?.variables),
         );
         if (actCacheContext) {
           const cachedResult = await this.actCache.tryReplay(
@@ -1407,58 +1387,62 @@ export class V3 {
 
   /** Best-effort cleanup of context and launched resources. */
   async close(opts?: { force?: boolean }): Promise<void> {
-    if (this.apiClient) {
-      await this.apiClient.end();
-    }
     // If we're already closing and this isn't a forced close, no-op.
     if (this._isClosing && !opts?.force) return;
     this._isClosing = true;
+
+    const keepAlive = this.keepAlive === true;
+
+    // Unhook CDP transport close handler BEFORE ending the API session.
+    // apiClient.end() can cause the hosted API to terminate the Browserbase
+    // session, which closes the CDP WebSocket. If the handler is still
+    // registered, _onCdpClosed fires and re-enters close() with force=true,
+    // causing a double-close cascade.
+    try {
+      if (this.ctx?.conn && this._onCdpClosed) {
+        this.ctx.conn.offTransportClosed?.(this._onCdpClosed);
+      }
+    } catch {
+      // ignore
+    }
+
+    // End Browserbase session via API when keepAlive is not enabled
+    if (!keepAlive && this.apiClient) {
+      try {
+        await this.apiClient.end();
+      } catch {
+        // best-effort cleanup
+      }
+    }
 
     try {
       // Close session file logger
       try {
         await SessionFileLogger.close();
       } catch {
-        // Fail silently
+        // ignore
       }
 
-      // Unhook CDP transport close handler if context exists
-      try {
-        if (this.ctx?.conn && this._onCdpClosed) {
-          this.ctx.conn.offTransportClosed?.(this._onCdpClosed);
-        }
-      } catch {
-        //
-      }
-
-      // Best-effort CDP/Context close
+      // Close CDP context
       try {
         await this.ctx?.close();
       } catch {
-        //
+        // ignore
       }
 
-      // Kill local Chrome if present
-      if (this.state.kind === "LOCAL") {
-        try {
-          await this.state.chrome.kill();
-        } catch {
-          //
-        }
-        // cleanup temp user data dir if we created it and not preserved
-        try {
-          if (
-            this.state.createdTempProfile &&
-            !this.state.preserveUserDataDir &&
-            this.state.userDataDir
-          ) {
-            fs.rmSync(this.state.userDataDir, { recursive: true, force: true });
-          }
-        } catch {
-          // ignore cleanup errors
-        }
+      // Kill local Chrome and clean up temp profile when keepAlive is not enabled
+      if (!keepAlive && this.state.kind === "LOCAL") {
+        const localState = this.state;
+        await cleanupLocalBrowser({
+          killChrome: () => localState.chrome.kill(),
+          userDataDir: localState.userDataDir,
+          createdTempProfile: localState.createdTempProfile,
+          preserveUserDataDir: localState.preserveUserDataDir,
+        });
       }
     } finally {
+      this.stopShutdownSupervisor();
+
       // Reset internal state
       this.state = { kind: "UNINITIALIZED" };
       this.ctx = null;
@@ -1469,28 +1453,15 @@ export class V3 {
       } catch {
         // ignore
       }
-      // Clear all event bus listeners to prevent memory leaks and hanging handlers
       try {
         this.bus.removeAllListeners();
       } catch {
         // ignore
       }
-      // Clear accumulated data to free memory
       this._history = [];
       this.actHandler = null;
       this.extractHandler = null;
       this.observeHandler = null;
-      // Cleanup all proxy auth listeners
-      for (const cleanup of this.proxyAuthHandlers.values()) {
-        try {
-          cleanup();
-        } catch {
-          // ignore
-        }
-      }
-      this.proxyAuthHandlers.clear();
-      this.proxyAuthHandlers = null;
-      // Remove from global registry
       V3._instances.delete(this);
     }
   }
@@ -1500,7 +1471,6 @@ export class V3 {
     let { apiKey, projectId } = this.opts;
 
     // Fall back to environment variables if not explicitly provided
-    // dotenv is already configured at the top of this module
     if (!apiKey)
       apiKey = process.env.BROWSERBASE_API_KEY ?? process.env.BB_API_KEY;
     if (!projectId)
@@ -1614,7 +1584,7 @@ export class V3 {
   }
 
   private async normalizeToV3Page(input: AnyPage): Promise<Page> {
-    if (input instanceof (await import("./understudy/page")).Page) {
+    if (input instanceof (await import("./understudy/page.js")).Page) {
       return input as Page;
     }
     if (this.isPlaywrightPage(input)) {
@@ -1711,13 +1681,13 @@ export class V3 {
       ? this.resolveLlmClient(options.model)
       : this.llmClient;
 
+    const resolvedExecutionModel = options?.executionModel ?? options?.model;
+
     const handler = new V3AgentHandler(
       this,
       this.logger,
       agentLlmClient,
-      typeof options?.executionModel === "string"
-        ? options.executionModel
-        : options?.executionModel?.modelName,
+      resolvedExecutionModel,
       options?.systemPrompt,
       tools,
       options?.mode,
@@ -1746,12 +1716,15 @@ export class V3 {
     const sanitizedOptions =
       this.agentCache.sanitizeExecuteOptions(resolvedOptions);
 
+    const cacheVariables = flattenVariables(resolvedOptions.variables);
+
     const cacheContext = this.agentCache.shouldAttemptCache(instruction)
       ? await this.agentCache.prepareContext({
           instruction,
           options: sanitizedOptions,
           configSignature: agentConfigSignature,
           page: await this.ctx!.awaitActivePage(),
+          variables: cacheVariables,
         })
       : null;
 
@@ -1815,11 +1788,10 @@ export class V3 {
       auxiliary: {
         cua: { value: isCuaMode ? "true" : "false", type: "boolean" },
         mode: { value: options?.mode ?? "dom", type: "string" },
-        model: options?.model
-          ? typeof options?.model === "string"
-            ? { value: options.model, type: "string" }
-            : { value: options.model.modelName, type: "string" }
-          : { value: this.llmClient.modelName, type: "string" },
+        model: {
+          value: extractModelName(options?.model) ?? this.llmClient.modelName,
+          type: "string",
+        },
         systemPrompt: { value: options?.systemPrompt ?? "", type: "string" },
         tools: { value: JSON.stringify(options?.tools ?? {}), type: "object" },
         ...(options?.integrations && {
@@ -1899,6 +1871,8 @@ export class V3 {
             const sanitizedOptions =
               this.agentCache.sanitizeExecuteOptions(resolvedOptions);
 
+            const cacheVariables = flattenVariables(resolvedOptions.variables);
+
             let cacheContext: AgentCacheContext | null = null;
             if (this.agentCache.shouldAttemptCache(instruction)) {
               const startPage = await this.ctx!.awaitActivePage();
@@ -1907,6 +1881,7 @@ export class V3 {
                 options: sanitizedOptions,
                 configSignature: agentConfigSignature,
                 page: startPage,
+                variables: cacheVariables,
               });
               if (cacheContext) {
                 const replayed = await this.agentCache.tryReplay(cacheContext);

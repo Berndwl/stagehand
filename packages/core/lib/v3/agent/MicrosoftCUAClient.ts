@@ -1,15 +1,15 @@
 import OpenAI from "openai";
-import { LogLine } from "../types/public/logs";
+import { LogLine } from "../types/public/logs.js";
 import {
   AgentAction,
   AgentResult,
   AgentType,
   AgentExecutionOptions,
-} from "../types/public/agent";
-import { ClientOptions } from "../types/public/model";
-import { AgentClient } from "./AgentClient";
-import { AgentScreenshotProviderError } from "../types/public/sdkErrors";
-import { mapKeyToPlaywright } from "./utils/cuaKeyMapping";
+} from "../types/public/agent.js";
+import { ClientOptions } from "../types/public/model.js";
+import { AgentClient } from "./AgentClient.js";
+import { AgentScreenshotProviderError } from "../types/public/sdkErrors.js";
+import { mapKeyToPlaywright } from "./utils/cuaKeyMapping.js";
 import { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
 /**
@@ -329,11 +329,13 @@ For each function call, return a json object with function name and arguments wi
           } catch (retryError) {
             throw new Error(
               `Failed to parse action text even after fixing double brackets. Original: ${actionText}. Fixed: ${fixedText}. Error: ${retryError}`,
+              { cause: retryError },
             );
           }
         } else {
           throw new Error(
             `Failed to parse action text as JSON: ${actionText}. Error: ${jsonError}`,
+            { cause: jsonError },
           );
         }
       }
@@ -351,6 +353,7 @@ For each function call, return a json object with function name and arguments wi
     } catch (error) {
       throw new Error(
         `Failed to parse FARA tool call from response: ${response}. Error: ${error}`,
+        { cause: error },
       );
     }
   }
@@ -854,7 +857,7 @@ For each function call, return a json object with function name and arguments wi
     let completed = false;
     const actions: AgentAction[] = [];
     const messageList: string[] = [];
-    let finalMessage = "";
+    let finalMessage: string;
     let totalInputTokens = 0;
     let totalOutputTokens = 0;
     let totalInferenceTime = 0;

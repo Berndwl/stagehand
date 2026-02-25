@@ -3,10 +3,10 @@ import {
   locatorScriptBootstrap,
   locatorScriptGlobalRefs,
   type LocatorScriptName,
-} from "../dom/build/locatorScripts.generated";
-import { v3Logger } from "../logger";
-import type { Frame } from "./frame";
-import { executionContexts } from "./executionContextRegistry";
+} from "../dom/build/locatorScripts.generated.js";
+import { v3Logger } from "../logger.js";
+import type { Frame } from "./frame.js";
+import { executionContexts } from "./executionContextRegistry.js";
 
 export type SelectorQuery =
   | { kind: "css"; value: string }
@@ -222,17 +222,6 @@ export class FrameSelectorResolver {
       1000,
     );
 
-    v3Logger({
-      category: "locator",
-      message: "xpath main-world",
-      level: 2,
-      auxiliary: {
-        frameId: { value: String(this.frame.frameId), type: "string" },
-        xp: { value: value, type: "string" },
-        ctxId: { value: String(ctxId), type: "string" },
-      },
-    });
-
     const results: ResolvedNode[] = [];
     for (let index = 0; index < limit; index += 1) {
       const expr = this.buildLocatorInvocation("resolveXPathMainWorld", [
@@ -379,7 +368,7 @@ export class FrameSelectorResolver {
     objectId: Protocol.Runtime.RemoteObjectId,
   ): Promise<ResolvedNode | null> {
     const session = this.frame.session;
-    let nodeId: Protocol.DOM.NodeId | null = null;
+    let nodeId: Protocol.DOM.NodeId | null;
     try {
       const rn = await session.send<{ nodeId: Protocol.DOM.NodeId }>(
         "DOM.requestNode",

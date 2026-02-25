@@ -1,13 +1,14 @@
 import { Protocol } from "devtools-protocol";
-import type { CDPSessionLike } from "./cdp";
-import type { Frame } from "./frame";
-import type { Locator } from "./locator";
-import type { Page } from "./page";
+import type { CDPSessionLike } from "./cdp.js";
+import type { Frame } from "./frame.js";
+import type { Locator } from "./locator.js";
+import type { Page } from "./page.js";
 import type {
   ScreenshotClip,
   ScreenshotScaleOption,
-} from "../types/public/screenshotTypes";
-import { StagehandInvalidArgumentError } from "../types/public/sdkErrors";
+} from "../types/public/screenshotTypes.js";
+import { StagehandInvalidArgumentError } from "../types/public/sdkErrors.js";
+import { screenshotScriptSources } from "../dom/build/screenshotScripts.generated.js";
 
 export type ScreenshotCleanup = () => Promise<void> | void;
 
@@ -205,15 +206,27 @@ export async function applyMaskOverlays(
   locators: Locator[],
   color: string,
 ): Promise<ScreenshotCleanup> {
-  const rectsByFrame = new Map<Frame, ScreenshotClip[]>();
+  type MaskRectSpec = ScreenshotClip & { rootToken?: string | null };
+  const rectsByFrame = new Map<
+    Frame,
+    { rects: MaskRectSpec[]; rootTokens: Set<string> }
+  >();
+
+  const token = `__v3_mask_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 
   for (const locator of locators) {
     try {
-      const info = await resolveMaskRects(locator);
+      const info = await resolveMaskRects(locator, token);
       if (!info) continue;
-      const list = rectsByFrame.get(info.frame) ?? [];
-      list.push(...info.rects);
-      rectsByFrame.set(info.frame, list);
+      const entry = rectsByFrame.get(info.frame) ?? {
+        rects: [],
+        rootTokens: new Set<string>(),
+      };
+      entry.rects.push(...info.rects);
+      for (const rect of info.rects) {
+        if (rect.rootToken) entry.rootTokens.add(rect.rootToken);
+      }
+      rectsByFrame.set(info.frame, entry);
     } catch {
       // ignore individual locator failures
     }
@@ -223,19 +236,42 @@ export async function applyMaskOverlays(
     return async () => {};
   }
 
-  const token = `__v3_mask_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-
   await Promise.all(
-    Array.from(rectsByFrame.entries()).map(([frame, rects]) =>
+    Array.from(rectsByFrame.entries()).map(([frame, { rects }]) =>
       frame
         .evaluate(
           ({ rects, color, token }) => {
             try {
               const doc = document;
               if (!doc) return;
-              const root = doc.documentElement || doc.body;
-              if (!root) return;
               for (const rect of rects) {
+                const defaultRoot = doc.documentElement || doc.body;
+                if (!defaultRoot) return;
+                const root = rect.rootToken
+                  ? doc.querySelector(
+                      `[data-stagehand-mask-root="${rect.rootToken}"]`,
+                    ) || defaultRoot
+                  : defaultRoot;
+                if (!root) continue;
+                if (rect.rootToken) {
+                  try {
+                    const style = window.getComputedStyle(root as Element);
+                    if (style && style.position === "static") {
+                      const rootEl = root as HTMLElement;
+                      if (
+                        !rootEl.hasAttribute("data-stagehand-mask-root-pos")
+                      ) {
+                        rootEl.setAttribute(
+                          "data-stagehand-mask-root-pos",
+                          rootEl.style.position || "",
+                        );
+                      }
+                      rootEl.style.position = "relative";
+                    }
+                  } catch {
+                    // ignore
+                  }
+                }
                 const el = doc.createElement("div");
                 el.setAttribute("data-stagehand-mask", token);
                 el.style.position = "absolute";
@@ -248,7 +284,7 @@ export async function applyMaskOverlays(
                 el.style.zIndex = "2147483647";
                 el.style.opacity = "1";
                 el.style.mixBlendMode = "normal";
-                root.appendChild(el);
+                (root as Element).appendChild(el);
               }
             } catch {
               // ignore
@@ -262,20 +298,37 @@ export async function applyMaskOverlays(
 
   return async () => {
     await Promise.all(
-      Array.from(rectsByFrame.keys()).map((frame) =>
+      Array.from(rectsByFrame.entries()).map(([frame, { rootTokens }]) =>
         frame
-          .evaluate((token) => {
-            try {
-              const doc = document;
-              if (!doc) return;
-              const nodes = doc.querySelectorAll(
-                `[data-stagehand-mask="${token}"]`,
-              );
-              nodes.forEach((node) => node.remove());
-            } catch {
-              // ignore
-            }
-          }, token)
+          .evaluate(
+            ({ token, rootTokens }) => {
+              try {
+                const doc = document;
+                if (!doc) return;
+                const nodes = doc.querySelectorAll(
+                  `[data-stagehand-mask="${token}"]`,
+                );
+                nodes.forEach((node) => node.remove());
+                for (const rootToken of rootTokens) {
+                  const root = doc.querySelector(
+                    `[data-stagehand-mask-root="${rootToken}"]`,
+                  ) as HTMLElement | null;
+                  if (!root) continue;
+                  const prev = root.getAttribute(
+                    "data-stagehand-mask-root-pos",
+                  );
+                  if (prev !== null) {
+                    root.style.position = prev;
+                    root.removeAttribute("data-stagehand-mask-root-pos");
+                  }
+                  root.removeAttribute("data-stagehand-mask-root");
+                }
+              } catch {
+                // ignore
+              }
+            },
+            { token, rootTokens: Array.from(rootTokens) },
+          )
           .catch(() => {}),
       ),
     );
@@ -284,21 +337,27 @@ export async function applyMaskOverlays(
 
 async function resolveMaskRects(
   locator: Locator,
-): Promise<{ frame: Frame; rects: ScreenshotClip[] } | null> {
+  maskToken: string,
+): Promise<{
+  frame: Frame;
+  rects: Array<ScreenshotClip & { rootToken?: string | null }>;
+} | null> {
   const frame = locator.getFrame();
   const session = frame.session;
-  let resolved: Array<{
-    objectId: Protocol.Runtime.RemoteObjectId;
-    nodeId: Protocol.DOM.NodeId | null;
-  }> = [];
-
   try {
-    resolved = await locator.resolveNodesForMask();
-    const rects: ScreenshotClip[] = [];
+    const resolved: Array<{
+      objectId: Protocol.Runtime.RemoteObjectId;
+      nodeId: Protocol.DOM.NodeId | null;
+    }> = await locator.resolveNodesForMask();
+    const rects: Array<ScreenshotClip & { rootToken?: string | null }> = [];
 
     for (const { objectId } of resolved) {
       try {
-        const rect = await resolveMaskRectForObject(session, objectId);
+        const rect = await resolveMaskRectForObject(
+          session,
+          objectId,
+          maskToken,
+        );
         if (rect) rects.push(rect);
       } catch {
         // ignore individual element failures
@@ -320,26 +379,14 @@ async function resolveMaskRects(
 async function resolveMaskRectForObject(
   session: CDPSessionLike,
   objectId: Protocol.Runtime.RemoteObjectId,
-): Promise<ScreenshotClip | null> {
+  maskToken: string,
+): Promise<(ScreenshotClip & { rootToken?: string | null }) | null> {
   const result = await session.send<Protocol.Runtime.CallFunctionOnResponse>(
     "Runtime.callFunctionOn",
     {
       objectId,
-      functionDeclaration: `function() {
-        if (!this || typeof this.getBoundingClientRect !== 'function') return null;
-        const rect = this.getBoundingClientRect();
-        if (!rect) return null;
-        const style = window.getComputedStyle(this);
-        if (!style) return null;
-        if (style.visibility === 'hidden' || style.display === 'none') return null;
-        if (rect.width <= 0 || rect.height <= 0) return null;
-        return {
-          x: rect.left + window.scrollX,
-          y: rect.top + window.scrollY,
-          width: rect.width,
-          height: rect.height,
-        };
-      }`,
+      functionDeclaration: screenshotScriptSources.resolveMaskRect,
+      arguments: [{ value: maskToken }],
       returnByValue: true,
     },
   );
@@ -348,7 +395,9 @@ async function resolveMaskRectForObject(
     return null;
   }
 
-  const rect = result.result.value as ScreenshotClip | null;
+  const rect = result.result.value as
+    | (ScreenshotClip & { rootToken?: string | null })
+    | null;
   if (!rect) return null;
 
   const { x, y, width, height } = rect;
@@ -363,7 +412,16 @@ async function resolveMaskRectForObject(
     return null;
   }
 
-  return { x, y, width, height };
+  return {
+    x,
+    y,
+    width,
+    height,
+    rootToken:
+      rect.rootToken && typeof rect.rootToken === "string"
+        ? rect.rootToken
+        : undefined,
+  };
 }
 
 export async function runScreenshotCleanups(

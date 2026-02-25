@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getCurrentDirPath } from "./runtimePaths.js";
 
 import fastify from "fastify";
 import fastifySwagger from "@fastify/swagger";
@@ -12,7 +12,6 @@ import {
   type FastifyZodOpenApiTypeProvider,
 } from "fastify-zod-openapi";
 import { Api } from "@browserbasehq/stagehand";
-import type { ZodOpenApiComponentsObject } from "zod-openapi";
 
 // Routes
 import actRoute from "../src/routes/v1/sessions/_id/act.js";
@@ -26,9 +25,7 @@ import startRoute from "../src/routes/v1/sessions/start.js";
 import healthcheckRoute from "../src/routes/healthcheck.js";
 import readinessRoute from "../src/routes/readiness.js";
 
-// @ts-expect-error - __dirname is not available in ES modules, using fileURLToPath workaround
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OUTPUT_PATH = path.resolve(__dirname, "../openapi.v3.yaml");
+const OUTPUT_PATH = path.resolve(getCurrentDirPath(), "../openapi.v3.yaml");
 
 async function main() {
   const app = fastify({
@@ -39,8 +36,10 @@ async function main() {
   app.setSerializerCompiler(serializerCompiler);
 
   // Register all API schemas as components so fastify-zod-openapi can create $ref links
-  const components: ZodOpenApiComponentsObject = {
+  const components = {
     schemas: {
+      // Region support
+      BrowserbaseRegion: Api.BrowserbaseRegionSchema,
       // Shared components
       LocalBrowserLaunchOptions: Api.LocalBrowserLaunchOptionsSchema,
       ModelConfigObject: Api.ModelConfigObjectSchema,
@@ -122,7 +121,6 @@ async function main() {
         version: "3.1.0",
         description: `Stagehand SDK for AI browser automation [ALPHA]. This API allows clients to
 execute browser automation tasks remotely on the Browserbase cloud.
-
 All endpoints except /sessions/start require an active session ID.
 Responses are streamed using Server-Sent Events (SSE) when the
 \`x-stream-response: true\` header is provided.
@@ -138,7 +136,6 @@ Please try it and give us your feedback, stay tuned for upcoming release announc
       servers: [
         {
           url: "https://api.stagehand.browserbase.com",
-          description: "Production Browserbase Cloud API",
         },
       ],
       components: {
@@ -173,8 +170,12 @@ Please try it and give us your feedback, stay tuned for upcoming release announc
   await app.ready();
 
   const yaml = app.swagger({ yaml: true });
+  // Mintlify expects OpenAPI version fields to be strings, so quote them here.
+  const fixedYaml = yaml
+    .replace(/^openapi:\s*(?!['"])([^#\s]+)\s*$/m, 'openapi: "$1"')
+    .replace(/^ {2}version:\s*(?!['"])([^#\s]+)\s*$/m, '  version: "$1"');
 
-  await writeFile(OUTPUT_PATH, yaml, "utf8");
+  await writeFile(OUTPUT_PATH, fixedYaml, "utf8");
 
   await app.close();
   console.log(`OpenAPI spec written to ${OUTPUT_PATH}`);

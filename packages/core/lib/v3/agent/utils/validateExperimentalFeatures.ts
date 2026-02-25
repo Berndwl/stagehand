@@ -1,8 +1,11 @@
 import {
   ExperimentalNotConfiguredError,
   StagehandInvalidArgumentError,
-} from "../../types/public/sdkErrors";
-import type { AgentConfig, AgentExecuteOptionsBase } from "../../types/public";
+} from "../../types/public/sdkErrors.js";
+import type {
+  AgentConfig,
+  AgentExecuteOptionsBase,
+} from "../../types/public/index.js";
 
 export interface AgentValidationOptions {
   /** Whether experimental mode is enabled */
@@ -62,6 +65,12 @@ export function validateExperimentalFeatures(
     if (executeOptions?.output) {
       unsupportedFeatures.push("output schema");
     }
+    if (
+      executeOptions?.variables &&
+      Object.keys(executeOptions.variables).length > 0
+    ) {
+      unsupportedFeatures.push("variables");
+    }
 
     if (unsupportedFeatures.length > 0) {
       throw new StagehandInvalidArgumentError(
@@ -105,6 +114,12 @@ export function validateExperimentalFeatures(
     }
     if (executeOptions.output) {
       features.push("output schema");
+    }
+    if (
+      executeOptions.variables &&
+      Object.keys(executeOptions.variables).length > 0
+    ) {
+      features.push("variables");
     }
   }
 

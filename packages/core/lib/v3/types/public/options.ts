@@ -1,11 +1,11 @@
 import { z } from "zod";
-import { LLMClient } from "../../llm/LLMClient";
-import { ModelConfiguration } from "./model";
-import { LogLine } from "./logs";
+import { LLMClient } from "../../llm/LLMClient.js";
+import { ModelConfiguration } from "./model.js";
+import { LogLine } from "./logs.js";
 import {
   type BrowserbaseSessionCreateParams,
   LocalBrowserLaunchOptionsSchema,
-} from "./api";
+} from "./api.js";
 
 export type V3Env = "LOCAL" | "BROWSERBASE";
 
@@ -27,6 +27,11 @@ export interface V3Options {
    */
   browserbaseSessionCreateParams?: BrowserbaseSessionCreateParams;
   browserbaseSessionID?: string;
+  /**
+   * Controls browser keepalive behavior. When set, it overrides any value in
+   * browserbaseSessionCreateParams.keepAlive.
+   */
+  keepAlive?: boolean;
 
   // Local Chromium (optional)
   localBrowserLaunchOptions?: LocalBrowserLaunchOptions;
@@ -49,4 +54,11 @@ export interface V3Options {
   cacheDir?: string;
   domSettleTimeout?: number;
   disableAPI?: boolean;
+  /**
+   * When true, enables server-side caching for API requests.
+   * When false, disables server-side caching.
+   * Defaults to true (caching enabled).
+   * Can be overridden per-method in act(), extract(), and observe() options.
+   */
+  serverCache?: boolean;
 }

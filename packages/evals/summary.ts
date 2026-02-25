@@ -1,6 +1,9 @@
 import fs from "fs";
-import { tasksByName } from "./taskConfig";
-import type { SummaryResult } from "./types/evals";
+import { tasksByName } from "./taskConfig.js";
+import type { SummaryResult } from "./types/evals.js";
+import { getRepoRootDir } from "./runtimePaths.js";
+
+const repoRoot = getRepoRootDir();
 
 export const generateSummary = async (
   results: SummaryResult[],
@@ -61,9 +64,7 @@ export const generateSummary = async (
     models,
   };
 
-  fs.writeFileSync(
-    "../../eval-summary.json",
-    JSON.stringify(formattedSummary, null, 2),
-  );
-  console.log("Evaluation summary written to ../../eval-summary.json");
+  const summaryPath = `${repoRoot}/eval-summary.json`;
+  fs.writeFileSync(summaryPath, JSON.stringify(formattedSummary, null, 2));
+  console.log(`Evaluation summary written to ${summaryPath}`);
 };

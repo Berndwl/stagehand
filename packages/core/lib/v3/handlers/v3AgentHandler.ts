@@ -1,7 +1,7 @@
-import { createAgentTools } from "../agent/tools";
-import { buildAgentSystemPrompt } from "../agent/prompts/agentSystemPrompt";
-import { LogLine } from "../types/public/logs";
-import { V3 } from "../v3";
+import { createAgentTools } from "../agent/tools/index.js";
+import { buildAgentSystemPrompt } from "../agent/prompts/agentSystemPrompt.js";
+import { LogLine } from "../types/public/logs.js";
+import { V3 } from "../v3.js";
 import {
   ModelMessage,
   ToolSet,
@@ -14,10 +14,10 @@ import {
   type StreamTextOnStepFinishCallback,
   type PrepareStepFunction,
 } from "ai";
-import { StagehandZodObject } from "../zodCompat";
-import { processMessages } from "../agent/utils/messageProcessing";
-import { LLMClient } from "../llm/LLMClient";
-import { SessionFileLogger } from "../flowLogger";
+import { StagehandZodObject } from "../zodCompat.js";
+import { processMessages } from "../agent/utils/messageProcessing.js";
+import { LLMClient } from "../llm/LLMClient.js";
+import { SessionFileLogger } from "../flowLogger.js";
 import {
   AgentExecuteOptions,
   AgentStreamExecuteOptions,
@@ -28,25 +28,49 @@ import {
   AgentStreamResult,
   AgentStreamCallbacks,
   AgentToolMode,
-} from "../types/public/agent";
-import { V3FunctionName } from "../types/public/methods";
-import { mapToolResultToActions } from "../agent/utils/actionMapping";
+  AgentModelConfig,
+  Variables,
+} from "../types/public/agent.js";
+import { V3FunctionName } from "../types/public/methods.js";
+import { mapToolResultToActions } from "../agent/utils/actionMapping.js";
 import {
   MissingLLMConfigurationError,
   StreamingCallbacksInNonStreamingModeError,
   AgentAbortError,
-} from "../types/public/sdkErrors";
-import { handleDoneToolCall } from "../agent/utils/handleDoneToolCall";
+} from "../types/public/sdkErrors.js";
+import { handleDoneToolCall } from "../agent/utils/handleDoneToolCall.js";
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Prepends a system message with cache control to the messages array.
+ * The cache control providerOptions are used by Anthropic and ignored by other providers.
+ */
+function prependSystemMessage(
+  systemPrompt: string,
+  messages: ModelMessage[],
+): ModelMessage[] {
+  return [
+    {
+      role: "system",
+      content: systemPrompt,
+      providerOptions: {
+        anthropic: {
+          cacheControl: { type: "ephemeral" },
+        },
+      },
+    },
+    ...messages,
+  ];
 }
 
 export class V3AgentHandler {
   private v3: V3;
   private logger: (message: LogLine) => void;
   private llmClient: LLMClient;
-  private executionModel?: string;
+  private executionModel?: string | AgentModelConfig;
   private systemInstructions?: string;
   private mcpTools?: ToolSet;
   private mode: AgentToolMode;
@@ -55,7 +79,7 @@ export class V3AgentHandler {
     v3: V3,
     logger: (message: LogLine) => void,
     llmClient: LLMClient,
-    executionModel?: string,
+    executionModel?: string | AgentModelConfig,
     systemInstructions?: string,
     mcpTools?: ToolSet,
     mode?: AgentToolMode,
@@ -91,9 +115,10 @@ export class V3AgentHandler {
         systemInstructions: this.systemInstructions,
         isBrowserbase: this.v3.isBrowserbase,
         excludeTools: options.excludeTools,
+        variables: options.variables,
       });
 
-      const tools = this.createTools(options.excludeTools);
+      const tools = this.createTools(options.excludeTools, options.variables);
       const allTools: ToolSet = { ...tools, ...this.mcpTools };
 
       // Use provided messages for continuation, or start fresh with the instruction
@@ -112,6 +137,18 @@ export class V3AgentHandler {
           ...SessionFileLogger.createLlmLoggingMiddleware(baseModel.modelId),
         },
       });
+
+      if (
+        this.mode === "hybrid" &&
+        !baseModel.modelId.includes("gemini-3-flash") &&
+        !baseModel.modelId.includes("claude")
+      ) {
+        this.logger({
+          category: "agent",
+          message: `Warning: "${baseModel.modelId}" may not perform well in hybrid mode. See recommended models: https://docs.stagehand.dev/v3/basics/agent#hybrid-mode`,
+          level: 0,
+        });
+      }
 
       return {
         options,
@@ -277,8 +314,7 @@ export class V3AgentHandler {
 
       const result = await this.llmClient.generateText({
         model: wrappedModel,
-        system: systemPrompt,
-        messages,
+        messages: prependSystemMessage(systemPrompt, messages),
         tools: allTools,
         stopWhen: (result) => this.handleStop(result, maxSteps),
         temperature: 1,
@@ -402,8 +438,7 @@ export class V3AgentHandler {
 
     const streamResult = this.llmClient.streamText({
       model: wrappedModel,
-      system: systemPrompt,
-      messages,
+      messages: prependSystemMessage(systemPrompt, messages),
       tools: allTools,
       stopWhen: (result) => this.handleStop(result, maxSteps),
       temperature: 1,
@@ -527,7 +562,7 @@ export class V3AgentHandler {
     };
   }
 
-  private createTools(excludeTools?: string[]) {
+  private createTools(excludeTools?: string[], variables?: Variables) {
     const provider = this.llmClient?.getLanguageModel?.()?.provider;
     return createAgentTools(this.v3, {
       executionModel: this.executionModel,
@@ -535,6 +570,7 @@ export class V3AgentHandler {
       mode: this.mode,
       provider,
       excludeTools,
+      variables,
     });
   }
 

@@ -5,8 +5,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import esbuild from "esbuild";
+import { getCurrentDirPath } from "../runtimePaths.js";
 
-const here = __dirname;
+const here = getCurrentDirPath();
 const outDir = path.join(here, "./build");
 fs.mkdirSync(outDir, { recursive: true });
 

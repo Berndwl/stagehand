@@ -1,6 +1,7 @@
 import { z } from "zod";
-import { LogLine } from "./v3/types/public/logs";
-import { ChatMessage, LLMClient } from "./v3/llm/LLMClient";
+import { LogLine } from "./v3/types/public/logs.js";
+import { ChatMessage, LLMClient } from "./v3/llm/LLMClient.js";
+import { getEnvTimeoutMs, withTimeout } from "./v3/timeoutConfig.js";
 import {
   buildActSystemPrompt,
   buildExtractSystemPrompt,
@@ -9,12 +10,22 @@ import {
   buildMetadataSystemPrompt,
   buildObserveSystemPrompt,
   buildObserveUserMessage,
-} from "./prompt";
-import { appendSummary, writeTimestampedTxtFile } from "./inferenceLogUtils";
-import type { InferStagehandSchema, StagehandZodObject } from "./v3/zodCompat";
+} from "./prompt.js";
+import { appendSummary, writeTimestampedTxtFile } from "./inferenceLogUtils.js";
+import type {
+  InferStagehandSchema,
+  StagehandZodObject,
+} from "./v3/zodCompat.js";
+import { SupportedUnderstudyAction } from "./v3/types/private/handlers.js";
 
 // Re-export for backward compatibility
-export type { LLMParsedResponse, LLMUsage } from "./v3/llm/LLMClient";
+export type { LLMParsedResponse, LLMUsage } from "./v3/llm/LLMClient.js";
+
+function withLlmTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+  const timeoutMs = getEnvTimeoutMs("LLM_MAX_MS");
+  if (!timeoutMs) return promise;
+  return withTimeout(promise, timeoutMs, `LLM ${operation}`);
+}
 
 export async function extract<T extends StagehandZodObject>({
   instruction,
@@ -73,8 +84,8 @@ export async function extract<T extends StagehandZodObject>({
   }
 
   const extractStartTime = Date.now();
-  const extractionResponse =
-    await llmClient.createChatCompletion<ExtractionResponse>({
+  const extractionResponse = await withLlmTimeout(
+    llmClient.createChatCompletion<ExtractionResponse>({
       options: {
         messages: extractCallMessages,
         response_model: {
@@ -87,12 +98,14 @@ export async function extract<T extends StagehandZodObject>({
         presence_penalty: 0,
       },
       logger,
-    });
+    }),
+    "extract",
+  );
   const extractEndTime = Date.now();
 
   const { data: extractedData, usage: extractUsage } = extractionResponse;
 
-  let extractResponseFile = "";
+  let extractResponseFile: string;
   if (logInferenceToFile) {
     const { fileName } = writeTimestampedTxtFile(
       "extract_summary",
@@ -138,8 +151,8 @@ export async function extract<T extends StagehandZodObject>({
   }
 
   const metadataStartTime = Date.now();
-  const metadataResponse =
-    await llmClient.createChatCompletion<MetadataResponse>({
+  const metadataResponse = await withLlmTimeout(
+    llmClient.createChatCompletion<MetadataResponse>({
       options: {
         messages: metadataCallMessages,
         response_model: {
@@ -152,7 +165,9 @@ export async function extract<T extends StagehandZodObject>({
         presence_penalty: 0,
       },
       logger,
-    });
+    }),
+    "extract metadata",
+  );
   const metadataEndTime = Date.now();
 
   const {
@@ -163,7 +178,7 @@ export async function extract<T extends StagehandZodObject>({
     usage: metadataResponseUsage,
   } = metadataResponse;
 
-  let metadataResponseFile = "";
+  let metadataResponseFile: string;
   if (logInferenceToFile) {
     const { fileName } = writeTimestampedTxtFile(
       "extract_summary",
@@ -255,9 +270,15 @@ export async function observe({
               "a description of the accessible element and its purpose",
             ),
           method: z
-            .string()
+            .enum(
+              // Use Object.values() for Zod v3 compatibility - z.enum() in v3 doesn't accept TypeScript enums directly
+              Object.values(SupportedUnderstudyAction) as unknown as readonly [
+                string,
+                ...string[],
+              ],
+            )
             .describe(
-              "the candidate method/action to interact with the element. Select one of the available Playwright interaction methods.",
+              `the candidate method/action to interact with the element. Select one of the available Understudy interaction methods.`,
             ),
           arguments: z.array(
             z
@@ -317,7 +338,7 @@ export async function observe({
   const reasoningTokens = observeUsage?.reasoning_tokens ?? 0;
   const cachedInputTokens = observeUsage?.cached_input_tokens ?? 0;
 
-  let responseFile = "";
+  let responseFile: string;
   if (logInferenceToFile) {
     const { fileName: responseFileName } = writeTimestampedTxtFile(
       `observe_summary`,
@@ -391,9 +412,15 @@ export async function act({
       .string()
       .describe("a description of the accessible element and its purpose"),
     method: z
-      .string()
+      .enum(
+        // Use Object.values() for Zod v3 compatibility - z.enum() in v3 doesn't accept TypeScript enums directly
+        Object.values(SupportedUnderstudyAction) as unknown as readonly [
+          string,
+          ...string[],
+        ],
+      )
       .describe(
-        "the candidate method/action to interact with the element. Select one of the available Playwright interaction methods.",
+        "the candidate method/action to interact with the element. Select one of the available Understudy interaction methods.",
       ),
     arguments: z.array(
       z
@@ -451,7 +478,7 @@ export async function act({
   const reasoningTokens = actUsage?.reasoning_tokens ?? 0;
   const cachedInputTokens = actUsage?.cached_input_tokens ?? 0;
 
-  let responseFile = "";
+  let responseFile: string;
   if (logInferenceToFile) {
     const { fileName: responseFileName } = writeTimestampedTxtFile(
       `act_summary`,

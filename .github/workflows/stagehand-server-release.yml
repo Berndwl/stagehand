@@ -31,19 +31,11 @@ jobs:
           fetch-depth: 1
           fetch-tags: true
 
-      - uses: pnpm/action-setup@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22.x
-          cache: 'pnpm'
-          cache-dependency-path: '**/pnpm-lock.yaml'
-
-      - name: Install dependencies
+      - uses: ./.github/actions/setup-node-pnpm-turbo
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
-        run: pnpm install --frozen-lockfile
+        with:
+          use-prebuilt-artifacts: "false"
 
       - name: Determine release metadata
         id: meta
@@ -102,8 +94,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
-
+          # Try to fetch the tag if it exists on remote; ignore failure for new tags
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}" 2>/dev/null || true
           if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
             echo "Tag already exists: ${TAG}"
             exit 0
@@ -117,6 +109,16 @@ jobs:
     needs: detect
     if: needs.detect.outputs.release == 'true'
     uses: ./.github/workflows/stagehand-server-sea-build.yml
+    with:
+      matrix: |
+        [
+          {"os":"ubuntu-latest","platform":"linux","arch":"x64","binary_name":"stagehand-server-linux-x64","include_sourcemaps":false},
+          {"os":"ubuntu-24.04-arm","platform":"linux","arch":"arm64","binary_name":"stagehand-server-linux-arm64","include_sourcemaps":false},
+          {"os":"macos-15","platform":"darwin","arch":"arm64","binary_name":"stagehand-server-darwin-arm64","include_sourcemaps":false},
+          {"os":"macos-15-intel","platform":"darwin","arch":"x64","binary_name":"stagehand-server-darwin-x64","include_sourcemaps":false},
+          {"os":"windows-latest","platform":"win32","arch":"x64","binary_name":"stagehand-server-win32-x64.exe","include_sourcemaps":false},
+          {"os":"windows-11-arm","platform":"win32","arch":"arm64","binary_name":"stagehand-server-win32-arm64.exe","include_sourcemaps":false}
+        ]
 
   release:
     name: Publish GitHub Release
@@ -142,8 +144,17 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: stagehand-server-*
-          path: release-assets
+          path: .
           merge-multiple: true
+
+      - name: Collect SEA binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in packages/server/dist/sea/stagehand-server-*; do
+            cp "$f" release-assets/
+          done
 
       - name: Create checksums
         shell: bash

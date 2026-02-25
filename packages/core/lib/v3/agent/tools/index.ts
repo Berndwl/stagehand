@@ -1,28 +1,32 @@
-import { gotoTool } from "./goto";
-import { actTool } from "./act";
-import { screenshotTool } from "./screenshot";
-import { waitTool } from "./wait";
-import { navBackTool } from "./navback";
-import { ariaTreeTool } from "./ariaTree";
-import { fillFormTool } from "./fillform";
-import { scrollTool, scrollVisionTool } from "./scroll";
-import { extractTool } from "./extract";
-import { clickTool } from "./click";
-import { typeTool } from "./type";
-import { dragAndDropTool } from "./dragAndDrop";
-import { clickAndHoldTool } from "./clickAndHold";
-import { keysTool } from "./keys";
-import { fillFormVisionTool } from "./fillFormVision";
-import { thinkTool } from "./think";
-import { searchTool } from "./search";
+import { gotoTool } from "./goto.js";
+import { actTool } from "./act.js";
+import { screenshotTool } from "./screenshot.js";
+import { waitTool } from "./wait.js";
+import { navBackTool } from "./navback.js";
+import { ariaTreeTool } from "./ariaTree.js";
+import { fillFormTool } from "./fillform.js";
+import { scrollTool, scrollVisionTool } from "./scroll.js";
+import { extractTool } from "./extract.js";
+import { clickTool } from "./click.js";
+import { typeTool } from "./type.js";
+import { dragAndDropTool } from "./dragAndDrop.js";
+import { clickAndHoldTool } from "./clickAndHold.js";
+import { keysTool } from "./keys.js";
+import { fillFormVisionTool } from "./fillFormVision.js";
+import { thinkTool } from "./think.js";
+import { searchTool } from "./search.js";
 
 import type { ToolSet, InferUITools } from "ai";
-import type { V3 } from "../../v3";
-import type { LogLine } from "../../types/public/logs";
-import type { AgentToolMode } from "../../types/public/agent";
+import type { V3 } from "../../v3.js";
+import type { LogLine } from "../../types/public/logs.js";
+import type {
+  AgentToolMode,
+  AgentModelConfig,
+  Variables,
+} from "../../types/public/agent.js";
 
 export interface V3AgentToolOptions {
-  executionModel?: string;
+  executionModel?: string | AgentModelConfig;
   logger?: (message: LogLine) => void;
   /**
    * Tool mode determines which set of tools are available.
@@ -39,6 +43,11 @@ export interface V3AgentToolOptions {
    * These tools will be filtered out after mode-based filtering.
    */
   excludeTools?: string[];
+  /**
+   * Variables available to the agent for use in act/type tools.
+   * When provided, these tools will have an optional useVariable field.
+   */
+  variables?: Variables;
 }
 
 /**
@@ -80,23 +89,24 @@ export function createAgentTools(v3: V3, options?: V3AgentToolOptions) {
   const mode = options?.mode ?? "dom";
   const provider = options?.provider;
   const excludeTools = options?.excludeTools;
+  const variables = options?.variables;
 
   const allTools: ToolSet = {
-    act: actTool(v3, executionModel),
+    act: actTool(v3, executionModel, variables),
     ariaTree: ariaTreeTool(v3),
     click: clickTool(v3, provider),
     clickAndHold: clickAndHoldTool(v3, provider),
     dragAndDrop: dragAndDropTool(v3, provider),
     extract: extractTool(v3, executionModel),
-    fillForm: fillFormTool(v3, executionModel),
-    fillFormVision: fillFormVisionTool(v3, provider),
+    fillForm: fillFormTool(v3, executionModel, variables),
+    fillFormVision: fillFormVisionTool(v3, provider, variables),
     goto: gotoTool(v3),
     keys: keysTool(v3),
     navback: navBackTool(v3),
     screenshot: screenshotTool(v3),
     scroll: mode === "hybrid" ? scrollVisionTool(v3, provider) : scrollTool(v3),
     think: thinkTool(),
-    type: typeTool(v3, provider),
+    type: typeTool(v3, provider, variables),
     wait: waitTool(v3, mode),
   };
 

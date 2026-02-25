@@ -109,7 +109,10 @@ export function logLineToString(logLine: LogLine): string {
   try {
     const timestamp = logLine.timestamp || new Date().toISOString();
     if (logLine.auxiliary?.error) {
-      return `${timestamp}::[stagehand:${logLine.category}] ${logLine.message}\n ${logLine.auxiliary.error.value}\n ${logLine.auxiliary.trace.value}`;
+      const errorValue = logLine.auxiliary.error?.value ?? "";
+      const traceValue = logLine.auxiliary.trace?.value ?? "";
+      const traceSuffix = traceValue ? `\n ${traceValue}` : "";
+      return `${timestamp}::[stagehand:${logLine.category}] ${logLine.message}\n ${errorValue}${traceSuffix}`;
     }
     return `${timestamp}::[stagehand:${logLine.category}] ${logLine.message} ${
       logLine.auxiliary ? JSON.stringify(logLine.auxiliary) : ""
@@ -156,7 +159,7 @@ export function sampleUniform<T>(arr: T[], k: number): T[] {
 }
 
 export function readJsonlFile(filePath: string): string[] {
-  let lines: string[] = [];
+  let lines: string[];
   try {
     const content = fs.readFileSync(filePath, "utf-8");
     lines = content.split(/\r?\n/).filter((l) => l.trim().length > 0);
